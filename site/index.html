@@ -1,0 +1,363 @@
+<!doctype html>
+<!--
+  Webstream — la page hébergée de screen-stream et de web-android-auto (GitHub Pages).
+
+  Elle ne contient pas le stream : elle cherche l'app sur le réseau local, s'y relie en WebTransport
+  (HTTP/3 sur QUIC), puis charge la page de l'app (assets/web/index.html de l'APK) par ce lien et lui
+  cède le document. Page et protocole restent donc ceux de l'APK installé ; ce fichier ne change qu'avec
+  le transport.
+
+  Le lien : https://<adresse>:<port>/webstream, authentifié non par une autorité mais par l'EMPREINTE du
+  certificat de l'app (`serverCertificateHashes`). Le navigateur n'accepte ainsi qu'un certificat de moins
+  de deux semaines : l'app sert l'un d'une suite fixe de certificats de 13 jours, un tous les 7 jours,
+  dont certs.js donne les empreintes (généré par screen-stream/webstream). Rien à configurer.
+
+  Une voie = un flux bidirectionnel QUIC : `asset` (les fichiers de la page de l'app), `ws`, `audio`. Sur
+  chaque flux, des trames [genre 1 octet : 0 texte, 1 binaire][longueur 4 octets][charge] ; la première,
+  de la page, nomme la voie. Les flux sont indépendants : le son n'attend pas derrière une image clé.
+
+  Réglages : config.js (adresses, port). Les adresses sont 3.3.3.1 (hotspot AVEC la clé platform) et
+  webas.local (screen-stream) / webaa.local (web-android-auto) SANS la clé et mDNS activé. Dans l'URL :
+    ?a=ip[,ip]    remplace les adresses (essais à l'atelier, p.ex. ?a=webaa.local).
+  Les autres paramètres (?diag=1, ?d=broadway) sont lus par la page de l'app.
+
+  Pas de stream : rien d'autre qu'une ligne discrète, et un nouvel essai toutes les 3 s.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Webstream</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #8a93ad;
+      font-family: system-ui, sans-serif; overflow: hidden; }
+    #msg { position: fixed; bottom: 12px; left: 0; right: 0; text-align: center; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div id="msg"></div>
+  <script src="config.js"></script>
+  <script src="certs.js"></script>
+  <script>
+  (() => {
+    'use strict';
+
+    // ---- Réglages ---------------------------------------------------------------------------------
+    const CFG = Object.assign({ addrs: ['3.3.3.1'], port: 3333 }, window.WEBSTREAM_CONFIG || {});
+    const PATH = '/webstream';
+    const TRY_MS = 4000;          // un essai (une adresse) sans réponse est abandonné
+    const RETRY_MS = 3000;        // entre deux tours sans stream
+    const TEXT = 0, BINARY = 1;   // genre d'une trame
+
+    const msgEl = document.getElementById('msg');
+    const say = (t) => { msgEl.textContent = t; };
+
+    const params = new URLSearchParams(location.search);
+    const addrs = (params.get('a') || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!addrs.length) addrs.push(...CFG.addrs);
+
+    // ---- Les empreintes à présenter au navigateur ---------------------------------------------------
+    // Celles des certificats valables autour de l'heure de CE navigateur (qui juge la validité à la
+    // sienne) : l'app sert celui qui laisse 3 jours de marge à la sienne, donc l'un de ceux-là.
+    function certHashes() {
+      const C = window.WEBSTREAM_CERTS;
+      if (!C || !C.hashes || !C.hashes.length) return [];
+      const n = C.hashes.length;
+      const i = Math.min(Math.max(Math.floor((Date.now() - C.epoch) / C.step), 0), n - 1);
+      const out = [];
+      for (let k = Math.max(i - 2, 0); k <= Math.min(i + 1, n - 1); k++) {
+        const bin = atob(C.hashes[k]);
+        const value = new Uint8Array(bin.length);
+        for (let j = 0; j < bin.length; j++) value[j] = bin.charCodeAt(j);
+        out.push({ algorithm: 'sha-256', value });
+      }
+      return out;
+    }
+
+    // ---- Trames ---------------------------------------------------------------------------------------
+    const enc = new TextEncoder(), dec = new TextDecoder();
+
+    function frame(kind, bytes) {
+      const f = new Uint8Array(5 + bytes.length);
+      f[0] = kind;
+      new DataView(f.buffer).setUint32(1, bytes.length);
+      f.set(bytes, 5);
+      return f;
+    }
+
+    /** Lecture d'un flux par trames : les morceaux reçus sont gardés tels quels, recollés une fois. */
+    class FrameReader {
+      constructor(readable) { this.r = readable.getReader(); this.chunks = []; this.len = 0; }
+      async need(n) {
+        while (this.len < n) {
+          const { value, done } = await this.r.read();
+          if (done) return false;
+          this.chunks.push(value);
+          this.len += value.length;
+        }
+        return true;
+      }
+      take(n) {
+        const out = new Uint8Array(n);
+        let off = 0;
+        while (off < n) {
+          const c = this.chunks[0];
+          const k = Math.min(c.length, n - off);
+          out.set(k === c.length ? c : c.subarray(0, k), off);
+          off += k;
+          if (k === c.length) this.chunks.shift(); else this.chunks[0] = c.subarray(k);
+        }
+        this.len -= n;
+        return out;
+      }
+      /** La trame suivante ({kind, data}), ou null en fin de flux. */
+      async next() {
+        if (!(await this.need(5))) return null;
+        const head = this.take(5);
+        const n = new DataView(head.buffer).getUint32(1);
+        if (!(await this.need(n))) return null;
+        return { kind: head[0], data: this.take(n) };
+      }
+      cancel() { try { this.r.cancel().catch(() => {}); } catch (e) {} }
+    }
+
+    // ---- Le lien avec l'app ---------------------------------------------------------------------------
+    /**
+     * Une session WebTransport, sa voie `asset` (fichiers de la page), et des voies ouvertes à la demande
+     * ([open]) qui se comportent comme des WebSocket pour la page de l'app. Perdu, il se rétablit au
+     * prochain [open] (même adresse d'abord).
+     */
+    class Link {
+      constructor() {
+        this.wt = null;
+        this.up = false;
+        this.addr = null;
+        this.assets = null;       // Sock de la voie `asset`
+        this.reviving = null;     // rétablissement en cours (une seule promesse)
+        this.suspect = false;     // la page a abandonné une voie : la session est peut-être morte
+        this.assetQueue = Promise.resolve();
+        this.workerUrlPromise = null;
+      }
+
+      get alive() { return !!this.wt && this.up; }
+
+      /** Essaie [addr] ; rend vrai si la session et sa voie `asset` s'ouvrent. */
+      async attempt(addr) {
+        let wt;
+        try {
+          wt = new WebTransport('https://' + addr + ':' + CFG.port + PATH,
+            { serverCertificateHashes: certHashes(), allowPooling: false });
+        } catch (e) { return false; }
+        wt.closed.catch(() => {});
+        let timer;
+        const timeout = new Promise((ok) => { timer = setTimeout(() => ok(false), TRY_MS); });
+        const ok = await Promise.race([wt.ready.then(() => true, () => false), timeout]);
+        clearTimeout(timer);
+        if (!ok) { try { wt.close(); } catch (e) {} return false; }
+        this.wt = wt;
+        this.up = true;
+        this.addr = addr;
+        wt.closed.then(() => {}, () => {}).finally(() => { if (this.wt === wt) this.up = false; });
+        this.assets = new Sock(this, 'asset', wt);
+        this.assets.binaryType = 'arraybuffer';
+        this.assetQueue = Promise.resolve();
+        if (!(await this.assets.opened)) { this.drop(); return false; }
+        return true;
+      }
+
+      drop() {
+        if (this.wt) { try { this.wt.close(); } catch (e) {} }
+        this.wt = null;
+        this.up = false;
+      }
+
+      /** Un tour des adresses, la dernière qui a marché d'abord. */
+      async connect() {
+        const list = this.addr ? [this.addr, ...addrs.filter((a) => a !== this.addr)] : addrs;
+        for (const a of list) {
+          if (await this.attempt(a)) return true;
+        }
+        return false;
+      }
+
+      /**
+       * Rétablit le lien s'il est perdu ; une seule tentative à la fois. ⚠️ Une session dont l'app a
+       * disparu sans la fermer (redémarrage, plantage) reste ouverte ~15 s aux yeux du navigateur : la
+       * page qui abandonne une voie muette ([suspect], cf. Sock.close) la fait refaire aussitôt.
+       */
+      revive() {
+        if (this.alive && !this.suspect) return Promise.resolve(true);
+        if (!this.reviving) {
+          this.suspect = false;
+          this.drop();
+          this.reviving = this.connect().finally(() => { this.reviving = null; });
+        }
+        return this.reviving;
+      }
+
+      /** Une voie neuve [label] (`ws`, `ws?have=1`, `audio`), présentée comme un WebSocket. */
+      open(label) { return new Sock(this, label, null); }
+
+      /** Le fichier [path] de la page de l'app (assets/web/…), en ArrayBuffer. */
+      asset(path) {
+        const run = () => new Promise(async (ok, ko) => {
+          if (!this.alive && !(await this.revive())) { ko(new Error('no link')); return; }
+          const s = this.assets;
+          const timer = setTimeout(() => { s.onmessage = null; ko(new Error('timeout: ' + path)); }, 15000);
+          s.onmessage = (m) => {
+            clearTimeout(timer);
+            s.onmessage = null;
+            if (typeof m.data === 'string') ko(new Error(m.data)); else ok(m.data);
+          };
+          try { s.send('GET ' + path); } catch (e) { clearTimeout(timer); ko(e); }
+        });
+        const p = this.assetQueue.then(run, run);
+        this.assetQueue = p.catch(() => {});
+        return p;
+      }
+
+      /**
+       * Le worker de Broadway (décodage logiciel, repli de WebCodecs), bâti en un seul script : ses
+       * importScripts relatifs et le chargement de avc.wasm visaient l'app, pas ce site.
+       */
+      workerUrl() {
+        if (!this.workerUrlPromise) {
+          const text = (b) => new TextDecoder().decode(b);
+          this.workerUrlPromise = (async () => {
+            const [dec, yuv, wrk, wasm] = [
+              await this.asset('broadway/Decoder.js'), await this.asset('broadway/YUVCanvas.js'),
+              await this.asset('broadway/h264-worker.js'), await this.asset('broadway/avc.wasm')];
+            let bin = '';
+            const u = new Uint8Array(wasm);
+            for (let i = 0; i < u.length; i += 0x8000) bin += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+            // avc.wasm : demandé par fetch() à une adresse relative, qu'un worker en mémoire ne résout
+            // pas — servi ici depuis les octets reçus.
+            const src = 'var __wasm=(function(s){var b=atob(s),u=new Uint8Array(b.length);' +
+              'for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;})("' + btoa(bin) + '");\n' +
+              '(function(){var f=self.fetch;self.fetch=function(u){return /avc\\.wasm$/.test(String(u&&u.url||u))?' +
+              'Promise.resolve(new Response(__wasm,{headers:{"Content-Type":"application/wasm"}})):' +
+              'f.apply(self,arguments);};})();\n' +
+              text(dec) + '\n' + text(yuv) + '\n' + text(wrk).replace(/^\s*importScripts\([^)]*\);?[ \t]*$/m, '');
+            return URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+          })();
+          this.workerUrlPromise.catch(() => { this.workerUrlPromise = null; });
+        }
+        return this.workerUrlPromise;
+      }
+    }
+
+    /**
+     * Une voie présentée comme un WebSocket (readyState, binaryType, on*, send, close, bufferedAmount) :
+     * la page de l'app n'a qu'à remplacer `new WebSocket(url)`. Un flux bidirectionnel de la session, dont
+     * la première trame nomme la voie.
+     */
+    class Sock {
+      constructor(link, label, wt) {
+        this.readyState = 0;
+        this.binaryType = 'blob';
+        this.onopen = this.onclose = this.onerror = this.onmessage = null;
+        this.label = label;
+        this.link = link;
+        this.writer = null;
+        this.reader = null;
+        this.pending = 0;         // octets confiés au flux, pas encore partis
+        let opened;
+        this.opened = new Promise((r) => { opened = r; });
+        const start = wt ? Promise.resolve(wt) : link.revive().then((up) => (up ? link.wt : null));
+        start.then(async (session) => {
+          if (this.readyState === 3) { opened(false); return; }
+          if (!session) { this.closed(1006, 'no stream'); opened(false); return; }
+          try {
+            const bs = await session.createBidirectionalStream();
+            this.writer = bs.writable.getWriter();
+            this.reader = new FrameReader(bs.readable);
+            await this.writer.write(frame(TEXT, enc.encode(label)));
+          } catch (e) { this.closed(1006, String(e)); opened(false); return; }
+          if (this.readyState !== 0) { this.abort(); opened(false); return; }
+          this.readyState = 1;
+          opened(true);
+          if (this.onopen) this.onopen({ type: 'open' });
+          this.pump();
+        });
+      }
+
+      async pump() {
+        try {
+          for (;;) {
+            const f = await this.reader.next();
+            if (!f) break;
+            this.emit(f.kind === TEXT ? dec.decode(f.data) : f.data.buffer);
+          }
+          this.closed(1000, 'channel closed');
+        } catch (e) {
+          this.closed(1006, 'channel closed');
+        }
+      }
+
+      emit(payload) {
+        if (this.readyState !== 1 || !this.onmessage) return;
+        const data = (typeof payload !== 'string' && this.binaryType === 'blob') ? new Blob([payload]) : payload;
+        this.onmessage({ data });
+      }
+
+      get bufferedAmount() { return this.pending; }
+
+      send(x) {
+        if (this.readyState !== 1) throw new DOMException('not open', 'InvalidStateError');
+        const f = typeof x === 'string' ? frame(TEXT, enc.encode(x))
+          : frame(BINARY, x instanceof ArrayBuffer ? new Uint8Array(x) : new Uint8Array(x.buffer, x.byteOffset, x.byteLength));
+        this.pending += f.length;
+        this.writer.write(f).then(() => { this.pending -= f.length; },
+          () => { this.pending -= f.length; this.closed(1006, 'write failed'); });
+      }
+
+      abort() {
+        if (this.writer) { try { this.writer.abort().catch(() => {}); } catch (e) {} }
+        if (this.reader) this.reader.cancel();
+      }
+
+      close() {
+        if (this.readyState >= 2) return;
+        // La page ne ferme une voie qu'en panne (lien muet, erreur) : la session est suspecte.
+        if (this.label !== 'asset') this.link.suspect = true;
+        this.readyState = 2;
+        this.abort();
+        this.closed(1000, '');
+      }
+
+      /** Comme un WebSocket : `onclose` une fois, jamais pendant l'appel qui ferme. */
+      closed(code, reason) {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        this.abort();
+        setTimeout(() => { if (this.onclose) this.onclose({ type: 'close', code, reason, wasClean: code === 1000 }); }, 0);
+      }
+    }
+    Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+
+    // ---- Démarrage -----------------------------------------------------------------------------------
+    async function main() {
+      if (typeof WebTransport !== 'function') { say('This browser has no WebTransport.'); return; }
+      if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+      const link = new Link();
+      for (;;) {
+        if (await link.connect()) break;
+        say('No stream');
+        await new Promise((r) => setTimeout(r, RETRY_MS));
+      }
+      say('');
+      let html;
+      try { html = new TextDecoder().decode(await link.asset('index.html')); }
+      catch (e) { say('Stream found, page not loaded: ' + e.message); setTimeout(() => location.reload(), RETRY_MS); return; }
+      // La page de l'app prend le document ; elle trouve le lien ici (cf. son `HOSTED`).
+      window.WEBSTREAM = link;
+      document.open();
+      document.write(html);
+      document.close();
+    }
+    main().catch((e) => say('Error: ' + (e && e.message)));
+  })();
+  </script>
+</body>
+</html>
