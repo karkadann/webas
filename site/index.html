@@ -17,9 +17,8 @@
   de la page, nomme la voie. Les flux sont indépendants : le son n'attend pas derrière une image clé.
 
   Réglages : config.js (adresses, port). Les adresses sont 3.3.3.1 (hotspot AVEC la clé platform) et
-  webas.local (screen-stream) / webaa.local (web-android-auto) SANS la clé et mDNS activé. Dans l'URL :
-    ?a=ip[,ip]    remplace les adresses (essais à l'atelier, p.ex. ?a=webaa.local).
-  Les autres paramètres (?diag=1, ?d=broadway) sont lus par la page de l'app.
+  webas.local (screen-stream) / webaa.local (web-android-auto) SANS la clé et mDNS activé. Aucun paramètre d'URL : la page essaie
+  les adresses de config.js, l'une après l'autre.
 
   Pas de stream : rien d'autre qu'une ligne discrète, et un nouvel essai toutes les 3 s.
 -->
@@ -53,9 +52,8 @@
     const msgEl = document.getElementById('msg');
     const say = (t) => { msgEl.textContent = t; };
 
-    const params = new URLSearchParams(location.search);
-    const addrs = (params.get('a') || '').split(',').map((s) => s.trim()).filter(Boolean);
-    if (!addrs.length) addrs.push(...CFG.addrs);
+    // Les adresses où chercher l'app : celles de config.js, et rien d'autre (aucun paramètre d'URL).
+    const addrs = CFG.addrs.slice();
 
     // ---- Les empreintes à présenter au navigateur ---------------------------------------------------
     // Celles des certificats valables autour de l'heure de CE navigateur (qui juge la validité à la
