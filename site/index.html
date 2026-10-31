@@ -1,0 +1,375 @@
+<!doctype html>
+<!--
+  Hosted page (GitHub Pages) for an Android app that serves its own page on the local network.
+
+  It does not hold the stream: it looks for the app on the local network, connects to it over WebTransport
+  (HTTP/3 over QUIC), then loads the app's page through that link and hands the document over to it. Page
+  and protocol thus remain those of the installed app; this file only changes with the transport.
+
+  The link: https://<address>:<port>/webstream, authenticated not by an authority but by the HASH of the
+  app's certificate (`serverCertificateHashes`). The browser then only accepts a certificate valid for less
+  than two weeks: the app serves one of a fixed series of 13-day certificates, one every 7 days, whose
+  hashes are listed in certs.js. Nothing to configure.
+
+  A channel = a bidirectional QUIC stream: `asset` (the files of the app's page), `ws`, `audio`. On each
+  stream, frames [kind 1 byte: 0 text, 1 binary][length 4 bytes][payload]; the first one, sent by the
+  page, names the channel. Streams are independent: audio does not wait behind a keyframe.
+
+  Settings: config.js (addresses, port, local page). No URL parameter: the page tries the
+  addresses of config.js, one after the other.
+
+  No stream: nothing but a discreet line, and a new attempt every 3 s.
+  Triple tap (or triple click) anywhere, while this page is shown: the page served by the app
+  itself, http://3.3.3.1 (config.js, `local`), without WebTransport — the fallback when the link does not come up
+  (device clock wrong after a reboot: certificate expired for the browser).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>WebAS</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #8a93ad;
+      font-family: system-ui, sans-serif; overflow: hidden; }
+    #msg { position: fixed; top: 50%; left: 0; right: 0; transform: translateY(-50%); text-align: center; font-size: 26px; }
+  </style>
+</head>
+<body>
+  <div id="msg"></div>
+  <script src="config.js"></script>
+  <script src="certs.js"></script>
+  <script>
+  (() => {
+    'use strict';
+
+    // ---- Settings ---------------------------------------------------------------------------------
+    const CFG = Object.assign({ addrs: ['3.3.3.1'], port: 3333, local: 'http://3.3.3.1/' }, window.WEBSTREAM_CONFIG || {});
+    const PATH = '/webstream';
+    const TRY_MS = 4000;          // an attempt (one address) with no answer is given up
+    const RETRY_MS = 3000;        // between two rounds without a stream
+    const TEXT = 0, BINARY = 1;   // kind of a frame
+
+    const msgEl = document.getElementById('msg');
+    const say = (t) => { msgEl.textContent = t; };
+
+    // ---- Triple tap: the app's page, served by the app (see the header) ------------------------------
+    // Only while this page is shown: once the app's page is loaded, its touches go to the device
+    // (`ceded`, on top of document.open which removes the listeners).
+    const TAPS = 3, TAP_MS = 600;   // three touches, each less than 600 ms after the previous one
+    let taps = 0, lastTap = -Infinity, ceded = false;
+    window.addEventListener('pointerdown', (e) => {
+      if (ceded || !e.isPrimary) return;
+      taps = e.timeStamp - lastTap < TAP_MS ? taps + 1 : 1;
+      lastTap = e.timeStamp;
+      if (taps >= TAPS) { taps = 0; location.href = CFG.local; }
+    });
+
+    // The addresses where to look for the app: those of config.js, and nothing else (no URL parameter).
+    const addrs = CFG.addrs.slice();
+
+    // ---- The hashes to present to the browser ------------------------------------------------------
+    // Those of the certificates valid around THIS browser's time (it judges validity by its own
+    // clock): the app serves the one leaving 3 days of margin by its own clock, so one of these.
+    function certHashes() {
+      const C = window.WEBSTREAM_CERTS;
+      if (!C || !C.hashes || !C.hashes.length) return [];
+      const n = C.hashes.length;
+      const i = Math.min(Math.max(Math.floor((Date.now() - C.epoch) / C.step), 0), n - 1);
+      const out = [];
+      for (let k = Math.max(i - 2, 0); k <= Math.min(i + 1, n - 1); k++) {
+        const bin = atob(C.hashes[k]);
+        const value = new Uint8Array(bin.length);
+        for (let j = 0; j < bin.length; j++) value[j] = bin.charCodeAt(j);
+        out.push({ algorithm: 'sha-256', value });
+      }
+      return out;
+    }
+
+    // ---- Frames ---------------------------------------------------------------------------------------
+    const enc = new TextEncoder(), dec = new TextDecoder();
+
+    function frame(kind, bytes) {
+      const f = new Uint8Array(5 + bytes.length);
+      f[0] = kind;
+      new DataView(f.buffer).setUint32(1, bytes.length);
+      f.set(bytes, 5);
+      return f;
+    }
+
+    /** Reads a stream frame by frame: received chunks are kept as they are, joined only once. */
+    class FrameReader {
+      constructor(readable) { this.r = readable.getReader(); this.chunks = []; this.len = 0; }
+      async need(n) {
+        while (this.len < n) {
+          const { value, done } = await this.r.read();
+          if (done) return false;
+          this.chunks.push(value);
+          this.len += value.length;
+        }
+        return true;
+      }
+      take(n) {
+        const out = new Uint8Array(n);
+        let off = 0;
+        while (off < n) {
+          const c = this.chunks[0];
+          const k = Math.min(c.length, n - off);
+          out.set(k === c.length ? c : c.subarray(0, k), off);
+          off += k;
+          if (k === c.length) this.chunks.shift(); else this.chunks[0] = c.subarray(k);
+        }
+        this.len -= n;
+        return out;
+      }
+      /** The next frame ({kind, data}), or null at the end of the stream. */
+      async next() {
+        if (!(await this.need(5))) return null;
+        const head = this.take(5);
+        const n = new DataView(head.buffer).getUint32(1);
+        if (!(await this.need(n))) return null;
+        return { kind: head[0], data: this.take(n) };
+      }
+      cancel() { try { this.r.cancel().catch(() => {}); } catch (e) {} }
+    }
+
+    // ---- The link with the app ------------------------------------------------------------------------
+    /**
+     * A WebTransport session, its `asset` channel (files of the page), and channels opened on demand
+     * ([open]) that behave like WebSockets for the app's page. When lost, it is restored on the next
+     * [open] (same address first).
+     */
+    class Link {
+      constructor() {
+        this.wt = null;
+        this.up = false;
+        this.addr = null;
+        this.assets = null;       // Sock of the `asset` channel
+        this.reviving = null;     // restore in progress (a single promise)
+        this.suspect = false;     // the page dropped a channel: the session may be dead
+        this.assetQueue = Promise.resolve();
+        this.workerUrlPromise = null;
+      }
+
+      get alive() { return !!this.wt && this.up; }
+
+      /** Tries [addr]; returns true if the session and its `asset` channel open. */
+      async attempt(addr) {
+        let wt;
+        try {
+          wt = new WebTransport('https://' + addr + ':' + CFG.port + PATH,
+            { serverCertificateHashes: certHashes(), allowPooling: false });
+        } catch (e) { return false; }
+        wt.closed.catch(() => {});
+        let timer;
+        const timeout = new Promise((ok) => { timer = setTimeout(() => ok(false), TRY_MS); });
+        const ok = await Promise.race([wt.ready.then(() => true, () => false), timeout]);
+        clearTimeout(timer);
+        if (!ok) { try { wt.close(); } catch (e) {} return false; }
+        this.wt = wt;
+        this.up = true;
+        this.addr = addr;
+        wt.closed.then(() => {}, () => {}).finally(() => { if (this.wt === wt) this.up = false; });
+        this.assets = new Sock(this, 'asset', wt);
+        this.assets.binaryType = 'arraybuffer';
+        this.assetQueue = Promise.resolve();
+        if (!(await this.assets.opened)) { this.drop(); return false; }
+        return true;
+      }
+
+      drop() {
+        if (this.wt) { try { this.wt.close(); } catch (e) {} }
+        this.wt = null;
+        this.up = false;
+      }
+
+      /** One round of the addresses, the last one that worked first. */
+      async connect() {
+        const list = this.addr ? [this.addr, ...addrs.filter((a) => a !== this.addr)] : addrs;
+        for (const a of list) {
+          if (await this.attempt(a)) return true;
+        }
+        return false;
+      }
+
+      /**
+       * Restores the link if it is lost; a single attempt at a time. ⚠️ A session whose app vanished
+       * without closing it (restart, crash) stays open ~15 s in the browser's eyes: the page dropping a
+       * silent channel ([suspect], see Sock.close) has it redone right away.
+       */
+      revive() {
+        if (this.alive && !this.suspect) return Promise.resolve(true);
+        if (!this.reviving) {
+          this.suspect = false;
+          this.drop();
+          this.reviving = this.connect().finally(() => { this.reviving = null; });
+        }
+        return this.reviving;
+      }
+
+      /** A new channel [label] (`ws`, `ws?have=1`, `audio`), presented as a WebSocket. */
+      open(label) { return new Sock(this, label, null); }
+
+      /** The file [path] of the app's page, as an ArrayBuffer. */
+      asset(path) {
+        const run = () => new Promise(async (ok, ko) => {
+          if (!this.alive && !(await this.revive())) { ko(new Error('no link')); return; }
+          const s = this.assets;
+          const timer = setTimeout(() => { s.onmessage = null; ko(new Error('timeout: ' + path)); }, 15000);
+          s.onmessage = (m) => {
+            clearTimeout(timer);
+            s.onmessage = null;
+            if (typeof m.data === 'string') ko(new Error(m.data)); else ok(m.data);
+          };
+          try { s.send('GET ' + path); } catch (e) { clearTimeout(timer); ko(e); }
+        });
+        const p = this.assetQueue.then(run, run);
+        this.assetQueue = p.catch(() => {});
+        return p;
+      }
+
+      /**
+       * The Broadway worker (software decoding, WebCodecs fallback), built as a single script: its
+       * relative importScripts and the loading of avc.wasm targeted the app, not this site.
+       */
+      workerUrl() {
+        if (!this.workerUrlPromise) {
+          const text = (b) => new TextDecoder().decode(b);
+          this.workerUrlPromise = (async () => {
+            const [dec, yuv, wrk, wasm] = [
+              await this.asset('broadway/Decoder.js'), await this.asset('broadway/YUVCanvas.js'),
+              await this.asset('broadway/h264-worker.js'), await this.asset('broadway/avc.wasm')];
+            let bin = '';
+            const u = new Uint8Array(wasm);
+            for (let i = 0; i < u.length; i += 0x8000) bin += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+            // avc.wasm: requested by fetch() at a relative address, which an in-memory worker cannot
+            // resolve — served here from the received bytes.
+            const src = 'var __wasm=(function(s){var b=atob(s),u=new Uint8Array(b.length);' +
+              'for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;})("' + btoa(bin) + '");\n' +
+              '(function(){var f=self.fetch;self.fetch=function(u){return /avc\\.wasm$/.test(String(u&&u.url||u))?' +
+              'Promise.resolve(new Response(__wasm,{headers:{"Content-Type":"application/wasm"}})):' +
+              'f.apply(self,arguments);};})();\n' +
+              text(dec) + '\n' + text(yuv) + '\n' + text(wrk).replace(/^\s*importScripts\([^)]*\);?[ \t]*$/m, '');
+            return URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+          })();
+          this.workerUrlPromise.catch(() => { this.workerUrlPromise = null; });
+        }
+        return this.workerUrlPromise;
+      }
+    }
+
+    /**
+     * A channel presented as a WebSocket (readyState, binaryType, on*, send, close, bufferedAmount):
+     * the app's page only has to replace `new WebSocket(url)`. A bidirectional stream of the session,
+     * whose first frame names the channel.
+     */
+    class Sock {
+      constructor(link, label, wt) {
+        this.readyState = 0;
+        this.binaryType = 'blob';
+        this.onopen = this.onclose = this.onerror = this.onmessage = null;
+        this.label = label;
+        this.link = link;
+        this.writer = null;
+        this.reader = null;
+        this.pending = 0;         // bytes handed to the stream, not yet sent
+        let opened;
+        this.opened = new Promise((r) => { opened = r; });
+        const start = wt ? Promise.resolve(wt) : link.revive().then((up) => (up ? link.wt : null));
+        start.then(async (session) => {
+          if (this.readyState === 3) { opened(false); return; }
+          if (!session) { this.closed(1006, 'no stream'); opened(false); return; }
+          try {
+            const bs = await session.createBidirectionalStream();
+            this.writer = bs.writable.getWriter();
+            this.reader = new FrameReader(bs.readable);
+            await this.writer.write(frame(TEXT, enc.encode(label)));
+          } catch (e) { this.closed(1006, String(e)); opened(false); return; }
+          if (this.readyState !== 0) { this.abort(); opened(false); return; }
+          this.readyState = 1;
+          opened(true);
+          if (this.onopen) this.onopen({ type: 'open' });
+          this.pump();
+        });
+      }
+
+      async pump() {
+        try {
+          for (;;) {
+            const f = await this.reader.next();
+            if (!f) break;
+            this.emit(f.kind === TEXT ? dec.decode(f.data) : f.data.buffer);
+          }
+          this.closed(1000, 'channel closed');
+        } catch (e) {
+          this.closed(1006, 'channel closed');
+        }
+      }
+
+      emit(payload) {
+        if (this.readyState !== 1 || !this.onmessage) return;
+        const data = (typeof payload !== 'string' && this.binaryType === 'blob') ? new Blob([payload]) : payload;
+        this.onmessage({ data });
+      }
+
+      get bufferedAmount() { return this.pending; }
+
+      send(x) {
+        if (this.readyState !== 1) throw new DOMException('not open', 'InvalidStateError');
+        const f = typeof x === 'string' ? frame(TEXT, enc.encode(x))
+          : frame(BINARY, x instanceof ArrayBuffer ? new Uint8Array(x) : new Uint8Array(x.buffer, x.byteOffset, x.byteLength));
+        this.pending += f.length;
+        this.writer.write(f).then(() => { this.pending -= f.length; },
+          () => { this.pending -= f.length; this.closed(1006, 'write failed'); });
+      }
+
+      abort() {
+        if (this.writer) { try { this.writer.abort().catch(() => {}); } catch (e) {} }
+        if (this.reader) this.reader.cancel();
+      }
+
+      close() {
+        if (this.readyState >= 2) return;
+        // The page only closes a channel on failure (silent link, error): the session is suspect.
+        if (this.label !== 'asset') this.link.suspect = true;
+        this.readyState = 2;
+        this.abort();
+        this.closed(1000, '');
+      }
+
+      /** Like a WebSocket: `onclose` once, never during the call that closes. */
+      closed(code, reason) {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        this.abort();
+        setTimeout(() => { if (this.onclose) this.onclose({ type: 'close', code, reason, wasClean: code === 1000 }); }, 0);
+      }
+    }
+    Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+
+    // ---- Startup -------------------------------------------------------------------------------------
+    async function main() {
+      if (typeof WebTransport !== 'function') { say('This browser has no WebTransport.'); return; }
+      if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+      const link = new Link();
+      for (;;) {
+        if (await link.connect()) break;
+        say('No stream');
+        await new Promise((r) => setTimeout(r, RETRY_MS));
+      }
+      say('');
+      let html;
+      try { html = new TextDecoder().decode(await link.asset('index.html')); }
+      catch (e) { say('Stream found, page not loaded: ' + e.message); setTimeout(() => location.reload(), RETRY_MS); return; }
+      // The app's page takes over the document; it finds the link here (see its `HOSTED`).
+      window.WEBSTREAM = link;
+      ceded = true;
+      document.open();
+      document.write(html);
+      document.close();
+    }
+    main().catch((e) => say('Error: ' + (e && e.message)));
+  })();
+  </script>
+</body>
+</html>
